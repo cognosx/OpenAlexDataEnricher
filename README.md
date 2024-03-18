@@ -27,12 +27,12 @@ FAQs
 
 Contact Information
 
-For further assistance or to provide feedback, please contact us at support@publicationsfetcher.com. We are committed to improving your experience and appreciate your input.
+For further assistance or to provide feedback, please contact us at cognosxx@gmail.com. We are committed to improving your experience and appreciate your input.
 Links to Further Resources
 
-    ORCID
-    Crossref
-    Altmetric
+    ORCID  https://orcid.org/
+    Crossref   https://www.crossref.org/
+    Altmetric   https://www.altmetric.com/
 
 Conclusion
 
