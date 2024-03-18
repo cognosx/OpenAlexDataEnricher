@@ -1,0 +1,65 @@
+.submit-button {
+    background-color: #ffa500; /* Blue background */
+    color: white; /* White text */
+    border: none; /* No border */
+  }
+
+
+/* assets/style.css */
+.center-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: left;
+}
+
+.center-block li {
+  list-style-type: none; /* Remove list bullets */
+}
+
+/* assets/style.css */
+.footer {
+  background-color: #f8f9fa; /* Light gray background */
+  padding: 20px 0;
+  font-size: 14px;
+}
+
+.footer-heading {
+  color: #007bff; /* Bootstrap primary color */
+  margin-bottom: 15px;
+}
+
+.text-muted {
+  color: #6c757d !important; /* Bootstrap muted text color */
+}
+
+/* Add more custom styles as needed */
+.footer-icon {
+  font-size: 16px; /* Example: Set a consistent icon size */
+  color: #ffa500;
+}
+
+.footer-link {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.icon-color {
+  color: #ffa500; /* Set your desired color */
+}
+
+/* assets/custom.css */
+
+.page-padding {
+  padding-left: 15px;
+  padding-right: 15px;
+}
+
+/* Or for responsive padding */
+@media (min-width: 992px) {
+  .page-padding {
+      padding-left: 100px; /* Increase side padding on larger screens */
+      padding-right: 100px;
+  }
+}
