@@ -1,4 +1,5 @@
 # index.py
+import os 
 from dash import Dash, html, dcc, callback, Input, Output
 from app import app, cache
 from pages import main
