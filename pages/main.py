@@ -81,6 +81,21 @@ def fetch_crossref_metadata(doi):
         return {}
 
 @cache.memoize()
+def fetch_openalex_metadata(doi):
+    openalex_url = f'https://api.openalex.org/works?filter=doi:{doi}'
+    # if response.status_code == 200 and response.json()['meta']['count'] > 0:
+    try:
+        response = requests.get(openalex_url)
+        response.raise_for_status() 
+        response_data = response.json()
+        works = response_data['results'][0] if response_data.get('results') and len(response_data['results']) > 0 else {}
+        # works = response.json()['results'][0]
+        return works#[0] if works else {}
+    except requests.RequestException as e:
+        print(f"Error fetching OpenAlex publications: {e}")
+        return {}
+
+@cache.memoize()
 def fetch_altmetric_data(doi):
     altmetric_url = f'https://api.altmetric.com/v1/doi/{doi}'
     try:
@@ -97,25 +112,137 @@ def build_publications_dataframe(orcid_id):
     return pd.DataFrame(publications_data)
 
 def collect_publication_info(doi):
-    metadata = fetch_crossref_metadata(doi)
+    crossref_metadata = fetch_crossref_metadata(doi)
     altmetric_data = fetch_altmetric_data(doi)
-    authors_list = metadata.get('author', [])
-    authors_name = [f"{author.get('given')} {author.get('family')}" for author in authors_list if 'given' in author and 'family' in author]
+    work  = fetch_openalex_metadata(doi) #openalex_metadata
+
+    # Define the list of unique institutions and their country codes
+    institutions_country = []
+    institution_type = []
+    first_authors_institutions_countries = []
+    last_authors_institutions_countries = []
+    corresponding_authors_institutions_countries = []
+    for authorship in work.get('authorships', []):
+        for institution in authorship.get('institutions', []):
+            institution_name = institution.get('display_name')
+            country_code = institution.get('country_code')
+            type_of_institution = institution.get('type')  # Renamed variable to avoid conflict
+            institutions_country.append(f"{institution_name} ({country_code})")
+            institution_type.append(f"{institution_name} ({type_of_institution})")  # Use the renamed variable here
+            if authorship.get('author_position') == 'first':
+                first_authors_institutions_countries.append(f"{institution_name} ({country_code})")
+            elif authorship.get('author_position') == 'last':
+                last_authors_institutions_countries.append(f"{institution_name} ({country_code})")
+            elif authorship.get('is_corresponding') == 'True':
+                corresponding_authors_institutions_countries.append(f"{institution_name} ({country_code})")
+
+    # Remove duplicates by converting the list to a set and then back to a list
+    institutions_country = list(set(institutions_country))
+    institution_type = list(set(institution_type))  # Use the renamed variable here
+    first_authors_institutions_countries = list(set(first_authors_institutions_countries))
+    last_authors_institutions_countries = list(set(last_authors_institutions_countries))
+    corresponding_authors_institutions_countries = list(set(corresponding_authors_institutions_countries))
+
+
+    # Define the set of unique author countries
+    author_countries = set()
+    for authorship in work.get('authorships', []):
+        for country in authorship.get('countries', []):
+            author_countries.add(country)
+    # Now, 'author_countries' is a set of unique author countries.
+    # You can convert it to a list if you prefer:
+    author_countries = list(author_countries)
+
+    # Get all the first, last, and corresponding authorships
+    first_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'first']
+    last_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'last']
+    corresponding_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('is_corresponding')]
+
+    # Get the author dictionary from each authorship
+    first_authors = [authorship.get('author', {}) for authorship in first_authorships]
+    last_authors = [authorship.get('author', {}) for authorship in last_authorships]
+    corresponding_authors = [authorship.get('author', {}) for authorship in corresponding_authorships]
+
+    # Get the display name of each author
+    first_author_names = [author.get('display_name') for author in first_authors]
+    last_author_names = [author.get('display_name') for author in last_authors]
+    corresponding_author_names = [author.get('display_name') for author in corresponding_authors]
+
+    # Get the author dictionary and country from each authorship
+    first_authors_countries = [authorship.get('countries', [])[0] if authorship.get('countries') else "Unknown" for authorship in first_authorships]
+    last_authors_countries = [authorship.get('countries', [])[0] if authorship.get('countries') else "Unknown" for authorship in last_authorships]
+    corresponding_authors_countries = [authorship.get('countries', [])[0] if authorship.get('countries') else "Unknown" for authorship in corresponding_authorships]
+
+
+    journal = "Not Available"  # Default value
+    primary_location = work.get('primary_location', {})
+    if primary_location:
+        source = primary_location.get('source', {})
+        if source:
+            journal = source.get('display_name', "Not Available")
+
+    # authors_list = crossref_metadata.get('author', [])
+    # authors_name = [f"{author.get('given')} {author.get('family')}" for author in authors_list if 'given' in author and 'family' in author]
     return {
-        'DOI': doi,
-        'Title': metadata.get('title', [''])[0],
-        'Authors Name': ', '.join(authors_name),
-        'Published Year': metadata.get('published', {}).get('date-parts', [[None]])[0][0],
-        'Journal': ', '.join(metadata.get('container-title', [])),
-        'Publisher': metadata.get('publisher', ''),
-        'Publication Type': metadata.get('type', ''),
-        'Subject': ', '.join(metadata.get('subject', [])),
-        'Funders': ', '.join(funder.get('name', '') for funder in metadata.get('funder', [])),
-        'Citation count': metadata.get('is-referenced-by-count', 0),
+        'ORCID DOI': doi,
+        'OpenAlex DOI': work.get('doi'),
+        'OpenAlex ID': work.get('id'),
+        'OpenAlex Title': work.get('display_name'),
+        # 'Title': crossref_metadata.get('title', [''])[0],
+        # 'Abstract': work.get('abstract'),
+        'OpenAlex Publication Year': work.get('publication_year'),
+        # 'Crossref Published Year': crossref_metadata.get('published', {}).get('date-parts', [[None]])[0][0],        
+        'OpenAlex Publication Date': work.get('publication_date'),
+
+        'OpenAlex Authors': ', '.join([authorship['author'].get('display_name', 'Unknown Author') for authorship in work.get('authorships', [])]),
+        # 'Authors Name': ', '.join(authors_name),
+        'OpenAlex First Authors': ', '.join(first_author_names),
+        'OpenAlex Last Authors': ', '.join(last_author_names),
+        'OpenAlex Corresponding Authors': ', '.join(corresponding_author_names),
+
+
+        'OpenAlex Institutions': ', '.join(institutions_country),
+        'OpenAlex Institutions Type': ', '.join(institution_type),
+        'OpenAlex First Authors Institutions Countries': ', '.join(first_authors_institutions_countries),
+        'OpenAlex Last Authors Institutions Countries': ', '.join(last_authors_institutions_countries),
+        # 'Corresponding Authors Institutions Countries': ', '.join(corresponding_authors_institutions_countries),
+        'OpenAlex Institutions Distinct Count': work.get('institutions_distinct_count'),
+
+        'OpenAlex Countries': ', '.join(author_countries),
+        'OpenAlex First Authors Countries': ', '.join(first_authors_countries),
+        'OpenAlex Last Authors Countries': ', '.join(last_authors_countries),
+        'OpenAlex Corresponding Authors Countries': ', '.join(corresponding_authors_countries),
+        'OpenAlex Countries Distinct Count': work.get('countries_distinct_count'),
+
+        'OpenAlex Journal': journal,
+        # 'Crossref Journal': ', '.join(crossref_metadata.get('container-title', [])),
+        'OpenAlex Crossref Publisher': crossref_metadata.get('publisher', ''),
+
+
+        'OpenAlex Crossref Subject': ', '.join(crossref_metadata.get('subject', [])),
+        'OpenAlex Keywords': ', '.join([keyword.get('keyword') for keyword in work.get('keywords', [])]),
+        'OpenAlex Mesh': ', '.join([mesh.get('descriptor_name') for mesh in work.get('mesh', [])]),
+        'OpenAlex Concepts': ', '.join([concept.get('display_name') for concept in work.get('concepts', [])]),
+        'OpenAlex Sustainable Development Goals': ', '.join([sdg.get('display_name') for sdg in work.get('sustainable_development_goals', [])]),
+
+        'Crossref Citation count': crossref_metadata.get('is-referenced-by-count', 0),
+        'OpenAlex Cited by Count': work.get('cited_by_count'),
+        'OpenAlex Counts by Year': str(work.get('counts_by_year')),
+
+    #     # Additional fields as needed,
+        'OpenAlex Publication Type': work.get('type'),
+        # 'Publication Type': crossref_metadata.get('type', ''),
+        'OpenAlex Indexed In': str(work.get('indexed_in')),
+
+        'OpenAlex Language': work.get('language'),
+        'OpenAlex Open Access status': work.get('open_access', {}).get('oa_status', None),
+        'OpenAlex grants': ', '.join([grant.get('funder_display_name') for grant in work.get('grants', [])]),
+        'Crossref Funders': ', '.join(funder.get('name', '') for funder in crossref_metadata.get('funder', [])),
+
         'Altmetric Score': altmetric_data.get('score'),
         'Altmetric Read Count': altmetric_data.get('readers_count'),
         'Altmetric Image': altmetric_data.get('images', {}).get('small'),
-        'Altmetric URL': altmetric_data.get('details_url')
+        'Altmetric URL': altmetric_data.get('details_url'),
     }
 
 
