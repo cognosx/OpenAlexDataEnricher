@@ -25,8 +25,8 @@ def Navbar():
                     dbc.Nav(
                         [
                             # dbc.NavItem(dbc.NavLink("Home", href="/")),
-                            dbc.NavItem(dbc.NavLink("Methodology", href="/methodology")),
-                            # dbc.NavItem(dbc.NavLink("Contact", href="/contact")),
+                            dbc.NavItem(dbc.NavLink("Methodology", href="/methodology", className='nav-link')),
+                            # dbc.NavItem(dbc.NavLink("Contact", href="/contact", className='nav-link')),
                         ],
                         className="ml-auto", # Aligns the nav items to the right of the navbar
                         navbar=True,
