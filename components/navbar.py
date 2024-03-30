@@ -40,7 +40,7 @@ def Navbar():
         ),
         color="dark",
         dark=True,
-        className="mb-4",  # Margin bottom for spacing
+        className="mb-4 sticky-navbar",  # Margin bottom for spacing
         sticky="top",
         # className="mb-5",  # Adds margin at the bottom for spacing, adjust as needed
     )
