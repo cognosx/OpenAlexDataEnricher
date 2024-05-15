@@ -220,7 +220,7 @@ def collect_publication_info(doi):
 
 
         'OpenAlex Crossref Subject': ', '.join(crossref_metadata.get('subject', [])),
-        'OpenAlex Keywords': ', '.join([keyword.get('keyword') for keyword in work.get('keywords', [])]),
+        'OpenAlex Keywords': ', '.join([keyword.get('display_name') for keyword in work.get('keywords', [])]),
         'OpenAlex Mesh': ', '.join([mesh.get('descriptor_name') for mesh in work.get('mesh', [])]),
         'OpenAlex Concepts': ', '.join([concept.get('display_name') for concept in work.get('concepts', [])]),
         'OpenAlex Sustainable Development Goals': ', '.join([sdg.get('display_name') for sdg in work.get('sustainable_development_goals', [])]),
