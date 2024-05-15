@@ -1,7 +1,4 @@
 # Import required libraries
-from components.navbar import Navbar  # Adjust according to your file structure
-from components.footer import Footer
-import os 
 import dash
 import pandas as pd
 import requests
@@ -10,26 +7,37 @@ from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import re
 from flask_caching import Cache
-import time
 from app import app, cache  # Importing app and cache here
 
+# Import custom components (adjust according to your file structure)
+from components.navbar import Navbar
+from components.footer import Footer
 
-
+# Define the layout
 def layout():
     return dbc.Container([
         Navbar(),  # Use the Navbar component
 
-        dbc.Row(dbc.Col(html.H1('Publications Fetcher'),  className="d-flex justify-content-center")), #width={"size": 3, "offset": 3},
-        dbc.Row(dbc.Col(html.P("Enter your ORCID ID to fetch and display your publications."), className="d-flex justify-content-center")),
+        dbc.Row(dbc.Col(html.H1('OpenAlex Data Enricher'), className="d-flex justify-content-center")),
+        dbc.Row(dbc.Col(html.P("Enter search parameters to fetch and display publications."), className="d-flex justify-content-center")),
         dbc.Row(
             dbc.Col([
-                dcc.Input(id='orcid-input', type='text', placeholder='e.g., 0000-0002-1825-0097', debounce=True, className="me-2"),
+                dcc.Input(id='search-input', type='text', placeholder='e.g., https://api.openalex.org/works?filter=authorships.institutions.continent:q15,publication_year:2024-2024,title_and_abstract.search:hiv+OR+aids+OR+%22Human+Immunodeficiency+Virus%22+OR+%22HIV/AIDS%22+OR+%22Human+Immunodeficiency+Viruses%22+OR+%22human+immuno-deficiency+virus%22+OR+%22Acquired+Immune+Deficiency+Syndrome%22+OR+%22Acquired+Immunodeficiency+Syndrome%22,type:types/review', debounce=True, className="me-2"),
                 html.Button('Submit', id='submit-button', n_clicks=0, className="submit-button")
             ], width=12, className="d-flex justify-content-center"),
-            justify="center"  # This centers the row
+            justify="center"
         ),
+        dbc.Row(dbc.Col(dbc.Checklist(
+            options=[
+                {'label': 'Include Crossref Data', 'value': 'crossref'},
+                {'label': 'Include Altmetric Data', 'value': 'altmetric'}
+            ],
+            value=[],
+            id='data-options',
+            inline=True
+        ), className="d-flex justify-content-center")),
         dbc.Row(dbc.Col(dbc.Alert(id='input-alert', color="warning", className="mt-3", style={"display": "none"}))),
-        dbc.Row(dbc.Col(dbc.Alert(id='status-alert', children="The ORCID number is valid. Fetching publications, please wait...", color="info", className="mt-3", style={"display": "none"}))),
+        dbc.Row(dbc.Col(dbc.Alert(id='status-alert', children="Valid search. Fetching publications, please wait...", color="info", className="mt-3", style={"display": "none"}))),
         dbc.Row(dbc.Col(dbc.Alert(id='status-alert-output', children="Publications ready. You can now view or download the list.", color="info", className="mt-3", style={"display": "none"}))),
 
         dbc.Row(dbc.Col(html.Div(id='spinner-container', children=[dbc.Spinner(size="lg", color="primary", type="border")], style={'display': 'none'}))),
@@ -39,38 +47,52 @@ def layout():
         dcc.Download(id='download-link'),
 
         dcc.Store(id='stored-data'),
-        dcc.Store(id='stored-orcid-id'),  # Additional stored data
+        dcc.Store(id='stored-search-query'),
 
-        html.Div(id='table-container', className="mt-3"),  # Placeholder for table
+        html.Div(id='table-container', className="mt-3"),
 
         Footer(),  # Use the Footer component
     ], fluid=True, className="py-3")
 
+############# Functions to fetch data ############################
 
-
-#############functions to fetch############################
+def clean_doi(doi):
+    """
+    Function to transform DOIs to the required format.
+    Converts https://doi.org/10.21203/rs.3.pex-2537/v1 to 10.21203/rs.3.pex-2537/v1.
+    """
+    if doi and doi.startswith("https://doi.org/"):
+        return doi.replace("https://doi.org/", "")
+    return doi
 
 @cache.memoize()
-def fetch_orcid_publications(orcid_id):
-    url = f'https://pub.orcid.org/v3.0/{orcid_id}/works'
-    headers = {'Accept': 'application/json'}
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()  # Raises HTTPError for bad responses
-        works = response.json().get('group', [])
-        dois = [
-            external_id['external-id-value']
-            for work in works
-            for external_id in work['work-summary'][0]['external-ids']['external-id']
-            if external_id['external-id-type'] == 'doi'
-        ]
-        return dois
-    except requests.RequestException as e:
-        print(f"Error fetching ORCID publications: {e}")
-        return []
+def fetch_openalex_publications(search_query, max_results=100000):
+    works = []
+    per_page = 25
+    cursor = '*'
+    while True:
+        url = f"{search_query}&per-page={per_page}&cursor={cursor}"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get('results', [])
+            if not results:
+                break
+            works.extend(results)
+            if len(works) >= max_results:
+                break
+            cursor = data.get('meta', {}).get('next_cursor')
+            if not cursor:
+                break
+        except requests.RequestException as e:
+            print(f"Error fetching OpenAlex publications: {e}")
+            break
+    return works
 
 @cache.memoize()
 def fetch_crossref_metadata(doi):
+    doi = clean_doi(doi)
     url = f'https://api.crossref.org/works/{doi}'
     try:
         response = requests.get(url)
@@ -81,22 +103,8 @@ def fetch_crossref_metadata(doi):
         return {}
 
 @cache.memoize()
-def fetch_openalex_metadata(doi):
-    openalex_url = f'https://api.openalex.org/works?filter=doi:{doi}'
-    # if response.status_code == 200 and response.json()['meta']['count'] > 0:
-    try:
-        response = requests.get(openalex_url)
-        response.raise_for_status() 
-        response_data = response.json()
-        works = response_data['results'][0] if response_data.get('results') and len(response_data['results']) > 0 else {}
-        # works = response.json()['results'][0]
-        return works#[0] if works else {}
-    except requests.RequestException as e:
-        print(f"Error fetching OpenAlex publications: {e}")
-        return {}
-
-@cache.memoize()
 def fetch_altmetric_data(doi):
+    doi = clean_doi(doi)
     altmetric_url = f'https://api.altmetric.com/v1/doi/{doi}'
     try:
         response = requests.get(altmetric_url)
@@ -106,29 +114,29 @@ def fetch_altmetric_data(doi):
         print(f"Error fetching Altmetric data: {e}")
         return {}
 
-def build_publications_dataframe(orcid_id):
-    dois = fetch_orcid_publications(orcid_id)
-    publications_data = [collect_publication_info(doi) for doi in dois]
+def build_publications_dataframe(search_query, include_crossref, include_altmetric):
+    works = fetch_openalex_publications(search_query)
+    publications_data = [collect_publication_info(work, include_crossref, include_altmetric) for work in works]
     return pd.DataFrame(publications_data)
 
-def collect_publication_info(doi):
-    crossref_metadata = fetch_crossref_metadata(doi)
-    altmetric_data = fetch_altmetric_data(doi)
-    work  = fetch_openalex_metadata(doi) #openalex_metadata
+def collect_publication_info(work, include_crossref, include_altmetric):
+    doi = work.get('doi', 'Not Available')
+    crossref_metadata = fetch_crossref_metadata(doi) if include_crossref and doi != 'Not Available' else {}
+    altmetric_data = fetch_altmetric_data(doi) if include_altmetric and doi != 'Not Available' else {}
 
-    # Define the list of unique institutions and their country codes
     institutions_country = []
     institution_type = []
     first_authors_institutions_countries = []
     last_authors_institutions_countries = []
     corresponding_authors_institutions_countries = []
+
     for authorship in work.get('authorships', []):
         for institution in authorship.get('institutions', []):
             institution_name = institution.get('display_name')
             country_code = institution.get('country_code')
-            type_of_institution = institution.get('type')  # Renamed variable to avoid conflict
+            type_of_institution = institution.get('type')
             institutions_country.append(f"{institution_name} ({country_code})")
-            institution_type.append(f"{institution_name} ({type_of_institution})")  # Use the renamed variable here
+            institution_type.append(f"{institution_name} ({type_of_institution})")
             if authorship.get('author_position') == 'first':
                 first_authors_institutions_countries.append(f"{institution_name} ({country_code})")
             elif authorship.get('author_position') == 'last':
@@ -136,141 +144,128 @@ def collect_publication_info(doi):
             elif authorship.get('is_corresponding') == 'True':
                 corresponding_authors_institutions_countries.append(f"{institution_name} ({country_code})")
 
-    # Remove duplicates by converting the list to a set and then back to a list
     institutions_country = list(set(institutions_country))
-    institution_type = list(set(institution_type))  # Use the renamed variable here
+    institution_type = list(set(institution_type))
     first_authors_institutions_countries = list(set(first_authors_institutions_countries))
     last_authors_institutions_countries = list(set(last_authors_institutions_countries))
     corresponding_authors_institutions_countries = list(set(corresponding_authors_institutions_countries))
 
-
-    # Define the set of unique author countries
     author_countries = set()
     for authorship in work.get('authorships', []):
         for country in authorship.get('countries', []):
             author_countries.add(country)
-    # Now, 'author_countries' is a set of unique author countries.
-    # You can convert it to a list if you prefer:
     author_countries = list(author_countries)
 
-    # Get all the first, last, and corresponding authorships
     first_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'first']
     last_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'last']
     corresponding_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('is_corresponding')]
 
-    # Get the author dictionary from each authorship
     first_authors = [authorship.get('author', {}) for authorship in first_authorships]
     last_authors = [authorship.get('author', {}) for authorship in last_authorships]
     corresponding_authors = [authorship.get('author', {}) for authorship in corresponding_authorships]
 
-    # Get the display name of each author
     first_author_names = [author.get('display_name') for author in first_authors]
     last_author_names = [author.get('display_name') for author in last_authors]
     corresponding_author_names = [author.get('display_name') for author in corresponding_authors]
 
-    # Get the author dictionary and country from each authorship
     first_authors_countries = [authorship.get('countries', [])[0] if authorship.get('countries') else "Unknown" for authorship in first_authorships]
     last_authors_countries = [authorship.get('countries', [])[0] if authorship.get('countries') else "Unknown" for authorship in last_authorships]
     corresponding_authors_countries = [authorship.get('countries', [])[0] if authorship.get('countries') else "Unknown" for authorship in corresponding_authorships]
 
-
-    journal = "Not Available"  # Default value
+    journal = "Not Available"
     primary_location = work.get('primary_location', {})
-    if primary_location:
-        source = primary_location.get('source', {})
-        if source:
-            journal = source.get('display_name', "Not Available")
+    source = primary_location.get('source', {}) if primary_location else {}
 
-    # authors_list = crossref_metadata.get('author', [])
-    # authors_name = [f"{author.get('given')} {author.get('family')}" for author in authors_list if 'given' in author and 'family' in author]
-    return {
-        'ORCID DOI': doi,
+    apc_list = work.get('apc_list', {}) or {}
+    apc_paid = work.get('apc_paid', {}) or {}
+
+    # Initialize the citation counts dictionary
+    citation_counts = {}
+    for count_data in work.get('counts_by_year', []):
+        year = count_data.get('year')
+        if year:
+            citation_counts[f'Citations {year}'] = count_data.get('cited_by_count', 0)
+
+    publication_info = {
         'OpenAlex DOI': work.get('doi'),
         'OpenAlex ID': work.get('id'),
         'OpenAlex Title': work.get('display_name'),
-        # 'Title': crossref_metadata.get('title', [''])[0],
-        # 'Abstract': work.get('abstract'),
         'OpenAlex Publication Year': work.get('publication_year'),
-        # 'Crossref Published Year': crossref_metadata.get('published', {}).get('date-parts', [[None]])[0][0],        
         'OpenAlex Publication Date': work.get('publication_date'),
-
         'OpenAlex Authors': ', '.join([authorship['author'].get('display_name', 'Unknown Author') for authorship in work.get('authorships', [])]),
-        # 'Authors Name': ', '.join(authors_name),
         'OpenAlex First Authors': ', '.join(first_author_names),
         'OpenAlex Last Authors': ', '.join(last_author_names),
         'OpenAlex Corresponding Authors': ', '.join(corresponding_author_names),
-
-
         'OpenAlex Institutions': ', '.join(institutions_country),
         'OpenAlex Institutions Type': ', '.join(institution_type),
         'OpenAlex First Authors Institutions Countries': ', '.join(first_authors_institutions_countries),
         'OpenAlex Last Authors Institutions Countries': ', '.join(last_authors_institutions_countries),
-        # 'Corresponding Authors Institutions Countries': ', '.join(corresponding_authors_institutions_countries),
         'OpenAlex Institutions Distinct Count': work.get('institutions_distinct_count'),
-
         'OpenAlex Countries': ', '.join(author_countries),
         'OpenAlex First Authors Countries': ', '.join(first_authors_countries),
         'OpenAlex Last Authors Countries': ', '.join(last_authors_countries),
         'OpenAlex Corresponding Authors Countries': ', '.join(corresponding_authors_countries),
         'OpenAlex Countries Distinct Count': work.get('countries_distinct_count'),
-
-        'OpenAlex Journal': journal,
-        # 'Crossref Journal': ', '.join(crossref_metadata.get('container-title', [])),
+        'OpenAlex Journal': source.get('display_name', "Not Available"),
+        'is_in_doaj': source.get('is_in_doaj', False),
         'OpenAlex Crossref Publisher': crossref_metadata.get('publisher', ''),
 
-
         'OpenAlex Crossref Subject': ', '.join(crossref_metadata.get('subject', [])),
+        'OpenAlex topics': ', '.join([topic.get('display_name') for topic in work.get('topics', [])]),
         'OpenAlex Keywords': ', '.join([keyword.get('display_name') for keyword in work.get('keywords', [])]),
         'OpenAlex Mesh': ', '.join([mesh.get('descriptor_name') for mesh in work.get('mesh', [])]),
         'OpenAlex Concepts': ', '.join([concept.get('display_name') for concept in work.get('concepts', [])]),
         'OpenAlex Sustainable Development Goals': ', '.join([sdg.get('display_name') for sdg in work.get('sustainable_development_goals', [])]),
-
         'Crossref Citation count': crossref_metadata.get('is-referenced-by-count', 0),
         'OpenAlex Cited by Count': work.get('cited_by_count'),
         'OpenAlex Counts by Year': str(work.get('counts_by_year')),
-
-    #     # Additional fields as needed,
         'OpenAlex Publication Type': work.get('type'),
-        # 'Publication Type': crossref_metadata.get('type', ''),
         'OpenAlex Indexed In': str(work.get('indexed_in')),
-
         'OpenAlex Language': work.get('language'),
         'OpenAlex Open Access status': work.get('open_access', {}).get('oa_status', None),
         'OpenAlex grants': ', '.join([grant.get('funder_display_name') for grant in work.get('grants', [])]),
         'Crossref Funders': ', '.join(funder.get('name', '') for funder in crossref_metadata.get('funder', [])),
-
         'Altmetric Score': altmetric_data.get('score'),
         'Altmetric Read Count': altmetric_data.get('readers_count'),
         'Altmetric Image': altmetric_data.get('images', {}).get('small'),
         'Altmetric URL': altmetric_data.get('details_url'),
+        'apc_list_value': apc_list.get('value', None),
+        'apc_list_currency': apc_list.get('currency', None),
+        'apc_list_value_usd': apc_list.get('value_usd', None),
+        'apc_list_provenance': apc_list.get('provenance', None),
+        'apc_paid_value': apc_paid.get('value', None),
+        'apc_paid_currency': apc_paid.get('currency', None),
+        'apc_paid_value_usd': apc_paid.get('value_usd', None),
+        'apc_paid_provenance': apc_paid.get('provenance', None),
+        'number_of_authors': len(work.get('authorships', []))
     }
 
+    # Add citation counts to publication_info
+    publication_info.update(citation_counts)
 
-
-
-####################################################
+    return publication_info
 
 @app.callback(
     [
-        Output('status-alert', 'children'),  # To update the message
-        Output('status-alert', 'style'),  # To show/hide the message alert
-        Output('spinner-container', 'style'),  # To show/hide the spinner
-        Output('stored-orcid-id', 'data'),  # To store the ORCID ID if valid
-        Output('table-container', 'children'),  # To display the data table
-        Output('download-button', 'disabled'),  # To enable/disable the download button
-        Output('download-button', 'style'),  # To show/hide the download button
-        Output('stored-data', 'data'),  # To store the fetched data for download
+        Output('status-alert', 'children'),
+        Output('status-alert', 'style'),
+        Output('spinner-container', 'style'),
+        Output('stored-search-query', 'data'),
+        Output('table-container', 'children'),
+        Output('download-button', 'disabled'),
+        Output('download-button', 'style'),
+        Output('stored-data', 'data'),
     ],
     [Input('submit-button', 'n_clicks')],
-    [State('orcid-input', 'value')],
+    [State('search-input', 'value'), State('data-options', 'value')],
     prevent_initial_call=True
 )
-def validate_fetch_and_update_ui(n_clicks, orcid_id):
-    if not orcid_id or not re.match(r'^\d{4}-\d{4}-\d{4}-[\dX]{4}$', orcid_id):
+def validate_fetch_and_update_ui(n_clicks, search_query, data_options):
+    if not search_query:
         return (
-            "Missing or Invalid ORCID ID format. Please correct it and try again.",
+            "Missing search query. Please enter a search term and try again.",
             {'display': 'block', 'color': 'warning'},
-            {'display': 'none'},  # Hide spinner
+            {'display': 'none'},
             no_update,
             no_update,
             True,
@@ -278,29 +273,27 @@ def validate_fetch_and_update_ui(n_clicks, orcid_id):
             no_update,
         )
 
-    # Valid ORCID ID, start fetching data
-    # Show spinner and update message
-    spinner_style = {'display': 'block'}  # Make spinner visible
-    message = "The ORCID number is valid. Fetching publications, please wait..."
+    spinner_style = {'display': 'block'}
+    message = "Valid search. Fetching publications, please wait..."
     alert_style = {'display': 'block', 'color': 'primary'}
 
+    include_crossref = 'crossref' in data_options
+    include_altmetric = 'altmetric' in data_options
+
     try:
-        df = build_publications_dataframe(orcid_id)
+        df = build_publications_dataframe(search_query, include_crossref, include_altmetric)
         if df.empty:
-            # Handle empty DataFrame (no publications found)
             return (
-                "No publications found for the provided ORCID ID.",
+                "No publications found for the provided search query.",
                 {'display': 'block', 'color': 'secondary'},
-                {'display': 'none'},  # Hide spinner
-                orcid_id,
+                {'display': 'none'},
+                search_query,
                 no_update,
                 True,
                 {'display': 'none'},
                 no_update,
             )
 
-        # Publications fetched, prepare the data table
-        # table = prepare_data_table(df)  # Assume this is a function that prepares the Dash DataTable
         tooltip_data = [
             {column: {'value': str(value), 'type': 'markdown'} for column, value in row.items()}
             for row in df.to_dict('records')
@@ -319,23 +312,21 @@ def validate_fetch_and_update_ui(n_clicks, orcid_id):
             tooltip_duration=None
         ), size="lg", color="primary", type="border", fullscreen=True)
 
-
         return (
             "Publications ready. You can now view or download the list.",
             {'display': 'block', 'color': 'success'},
-            {'display': 'none'},  # Hide spinner after fetching
-            orcid_id,
+            {'display': 'none'},
+            search_query,
             table,
-            False,  # Enable download button
-            {'display': 'block'},  # Show download button
+            False,
+            {'display': 'block'},
             df.to_dict('records'),
         )
     except Exception as e:
-        # Handle any exceptions during the fetching process
         return (
             f"An error occurred: {str(e)}",
             {'display': 'block', 'color': 'danger'},
-            {'display': 'none'},  # Hide spinner
+            {'display': 'none'},
             no_update,
             no_update,
             True,
@@ -343,41 +334,29 @@ def validate_fetch_and_update_ui(n_clicks, orcid_id):
             no_update,
         )
 
+@app.callback(
+    Output('download-link', 'data'),
+    [Input('download-button', 'n_clicks')],
+    [State('stored-data', 'data'), State('search-input', 'value')],
+    prevent_initial_call=True
+)
+def download_publications_list(n_clicks, stored_data, search_query):
+    if n_clicks is None or stored_data is None:
+        raise PreventUpdate
+    safe_search_query = re.sub(r'[^\w\-_]', '_', search_query)
+    filename = f"{safe_search_query}_publications_list.csv"
+    df = pd.DataFrame(stored_data)
+    return dcc.send_data_frame(df.to_csv, filename, index=False)
 
-
-
-#####################################################################################################
 @app.callback(
     Output("navbar-collapse", "is_open"),
     [Input("navbar-toggler", "n_clicks")],
-    [State("navbar-collapse", "is_open")],
+    [State("navbar-collapse", "is_open")]
 )
 def toggle_navbar_collapse(n, is_open):
     if n:
         return not is_open
     return is_open
-
-# Callback to download the data
-@app.callback(
-    Output('download-link', 'data'),
-    [Input('download-button', 'n_clicks')],
-    [State('stored-data', 'data'),  # Keeps existing state for the data
-     State('orcid-input', 'value')],  # Adds the ORCID ID as a state
-    prevent_initial_call=True
-)
-def download_publications_list(n_clicks, stored_data, orcid_id):
-    if n_clicks is None or stored_data is None:
-        raise PreventUpdate
-    # Sanitize the ORCID ID to ensure it's safe for use in a filename
-    # This removes any characters that might be invalid for filenames
-    safe_orcid_id = re.sub(r'[^\w\-_]', '_', orcid_id)
-    filename = f"{safe_orcid_id}_publications_list.csv"
-    # Convert the stored data back to a DataFrame
-    df = pd.DataFrame(stored_data)
-    # Return the CSV download, dynamically naming the file with the ORCID ID
-    return dcc.send_data_frame(df.to_csv, filename, index=False)
-
-
 
 if __name__ == '__main__':
     app.run_server(debug=True)
