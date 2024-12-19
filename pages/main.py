@@ -226,8 +226,7 @@ def rename_columns(df):
         'OpenAlex Last Authors Countries Income': 'Last Author Country Income Levels (OpenAlex)',
         'OpenAlex Corresponding Authors Countries Full Name': 'Corresponding Author Country Names (OpenAlex)',
         'OpenAlex Corresponding Authors Countries Region': 'Corresponding Author Country Regions (OpenAlex)',
-        'OpenAlex Corresponding Authors Countries Income': 'Corresponding Author Country Income Levels (OpenAlex)',
-   
+        'OpenAlex Corresponding Authors Countries Income': 'Corresponding Author Country Income Levels (OpenAlex)',   
     }
 
     return df.rename(columns=column_mapping)
@@ -764,7 +763,7 @@ def collect_publication_info(work, include_crossref, include_altmetric):
         'Readers Count': readers_count,
         'Altmetric Score': score,
 
-        'Altmetric Score History': history,
+        'Altmetric Score History': str(altmetric_data.get('history')),
         'History (1 Year)': history_1y,
         'History (6 Months)': history_6m,
         'History (3 Months)': history_3m,
