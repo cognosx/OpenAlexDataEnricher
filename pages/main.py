@@ -1,6 +1,7 @@
 # Import required libraries
 import dash
 import pandas as pd
+import numpy as np
 import requests
 from dash import dcc, html, dash_table, callback_context, Input, Output, State, no_update, callback
 from dash.exceptions import PreventUpdate
