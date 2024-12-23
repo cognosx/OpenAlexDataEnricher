@@ -58,7 +58,7 @@ def parse_uploaded_file(contents, filename):
         logging.error(f"Error parsing file: {e}")
         raise ValueError("Failed to parse the file. Ensure it is correctly formatted and contains valid DOIs.")
 
-def fetch_openalex_publications(search_query, max_results=100):
+def fetch_openalex_publications(search_query, max_results=100000):
     works = []
     per_page = 25
     cursor = '*'
