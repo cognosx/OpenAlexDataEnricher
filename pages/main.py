@@ -1009,7 +1009,7 @@ def process_inputs(input_type, n_clicks, file_contents, api_input, manual_doi_in
             manual_dois = [clean_doi(doi.strip()) for doi in manual_doi_input.split(',') if doi.strip()]
             dois.extend(manual_dois)
 
-        if input_type in ['doi', 'both'] and not dois:
+        if input_type == 'doi' and not dois:
             return (
                 "No DOIs provided.",
                 {'display': 'block', 'color': 'warning'},
