@@ -1,71 +1,130 @@
-# Import required libraries
 import dash
 import pandas as pd
 import numpy as np
 import requests
-from dash import dcc, html, dash_table, callback_context, Input, Output, State, no_update, callback
+from dash import dcc, html, dash_table, Input, Output, State, callback_context
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
-import re
+import base64
+import io
+import logging
 from flask_caching import Cache
-from app import app, cache  # Importing app and cache here
-
-# Import custom components (adjust according to your file structure)
+from datetime import datetime
+from app import app, cache  # Import app and cache here
 from components.navbar import Navbar
 from components.footer import Footer
+import time
 
-# Define the layout
-def layout():
-    return dbc.Container([
-        Navbar(),  # Use the Navbar component
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-        dbc.Row(dbc.Col(html.H1('OpenAlex Data Enricher'), className="d-flex justify-content-center")),
-        dbc.Row(dbc.Col(html.P("Enter search parameters to fetch and display publications."), className="d-flex justify-content-center")),
-        dbc.Row(
-            dbc.Col([
-                dcc.Input(id='search-input', type='text', placeholder='e.g., https://api.openalex.org/works?filter=authorships.institutions.continent:q15,publication_year:2024-2024,title_and_abstract.search:hiv+OR+aids+OR+%22Human+Immunodeficiency+Virus%22+OR+%22HIV/AIDS%22+OR+%22Human+Immunodeficiency+Viruses%22+OR+%22human+immuno-deficiency+virus%22+OR+%22Acquired+Immune+Deficiency+Syndrome%22+OR+%22Acquired+Immunodeficiency+Syndrome%22,type:types/review', debounce=True, className="me-2"),
-                html.Button('Submit', id='submit-button', n_clicks=0, className="submit-button")
-            ], width=12, className="d-flex justify-content-center"),
-            justify="center"
-        ),
-        dbc.Row(dbc.Col(dbc.Checklist(
-            options=[
-                {'label': 'Include Crossref Data', 'value': 'crossref'},
-                {'label': 'Include Altmetric Data', 'value': 'altmetric'}
-            ],
-            value=[],
-            id='data-options',
-            inline=True
-        ), className="d-flex justify-content-center")),
-        dbc.Row(dbc.Col(dbc.Alert(id='input-alert', color="warning", className="mt-3", style={"display": "none"}))),
-        dbc.Row(dbc.Col(dbc.Alert(id='status-alert', children="Valid search. Fetching publications, please wait...", color="info", className="mt-3", style={"display": "none"}))),
-        dbc.Row(dbc.Col(dbc.Alert(id='status-alert-output', children="Publications ready. You can now view or download the list.", color="info", className="mt-3", style={"display": "none"}))),
-
-        dbc.Row(dbc.Col(html.Div(id='spinner-container', children=[dbc.Spinner(size="lg", color="primary", type="border")], style={'display': 'none'}))),
-        dbc.Row(dbc.Col(html.Div(id='spinner-container-closed', children=[dbc.Spinner(size="lg", color="primary", type="border")], style={'display': 'none'}))),
-
-        dbc.Row(dbc.Col(html.Button('Download Publications List', id='download-button', disabled=True, className="mt-3", style={'display': 'none'}))),
-        dcc.Download(id='download-link'),
-
-        dcc.Store(id='stored-data'),
-        dcc.Store(id='stored-search-query'),
-
-        html.Div(id='table-container', className="mt-3"),
-
-        Footer(),  # Use the Footer component
-    ], fluid=True, className="py-3")
-
-############# Functions to fetch data ############################
+# Utility Functions
+def create_onboarding_modal():
+    return dbc.Modal(
+        [
+            dbc.ModalHeader("Welcome to the Publication Data Collector"),
+            dbc.ModalBody(
+                "This app allows you to fetch, enrich, and download publication data. Follow the steps provided to upload DOIs files or use the OpenAlex API."
+            ),
+            dbc.ModalFooter(dbc.Button("Got it!", id="close-onboarding", className="ms-auto")),
+        ],
+        id="onboarding-modal",
+        is_open=True,
+    )
 
 def clean_doi(doi):
-    """
-    Function to transform DOIs to the required format.
-    Converts https://doi.org/10.21203/rs.3.pex-2537/v1 to 10.21203/rs.3.pex-2537/v1.
-    """
     if doi and doi.startswith("https://doi.org/"):
         return doi.replace("https://doi.org/", "")
     return doi
-    
+
+def parse_uploaded_file(contents, filename):
+    try:
+        content_type, content_string = contents.split(',')
+        decoded = base64.b64decode(content_string).decode('utf-8')
+        if filename.endswith('.csv'):
+            df = pd.read_csv(io.StringIO(decoded))
+        elif filename.endswith('.txt'):
+            df = pd.DataFrame(decoded.splitlines(), columns=['DOI'])
+        else:
+            raise ValueError("Unsupported file type. Please upload a .csv or .txt file.")
+
+        if 'DOI' in df.columns:
+            dois = df['DOI'].dropna().tolist()
+        else:
+            dois = df.iloc[:, 0].dropna().tolist()
+
+        return [clean_doi(doi) for doi in dois]
+    except Exception as e:
+        logging.error(f"Error parsing file: {e}")
+        raise ValueError("Failed to parse the file. Ensure it is correctly formatted and contains valid DOIs.")
+
+def fetch_openalex_publications(search_query, max_results=100):
+    works = []
+    per_page = 25
+    cursor = '*'
+    while True:
+        url = f"{search_query}&per-page={per_page}&cursor={cursor}"
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get('results', [])
+            if not results:
+                break
+            works.extend(results)
+            if len(works) >= max_results:
+                break
+            cursor = data.get('meta', {}).get('next_cursor')
+            if not cursor:
+                break
+            time.sleep(1)  # Respect API rate limits
+        except requests.RequestException as e:
+            logging.error(f"Error fetching OpenAlex publications: {e}")
+            break
+    return works
+
+def fetch_works_by_doi(dois):
+    base_url = "https://api.openalex.org/works/http://dx.doi.org/"
+    works = []
+    for doi in dois:
+        url = f"{base_url}{clean_doi(doi)}"
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            work = response.json()
+            if 'id' in work:
+                works.append(work)
+            else:
+                logging.warning(f"DOI {doi} returned no results.")
+        except requests.Timeout:
+            logging.warning(f"Timeout error for DOI {doi}. Skipping.")
+        except requests.RequestException as e:
+            logging.error(f"Error fetching work for DOI {doi}: {e}")
+    return works
+
+def fetch_crossref_metadata(doi):
+    doi = clean_doi(doi)
+    url = f'https://api.crossref.org/works/{doi}'
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json().get('message', {})
+    except requests.RequestException as e:
+        logging.error(f"Error fetching Crossref metadata for DOI {doi}: {e}")
+        return {}
+
+def fetch_altmetric_data(doi):
+    doi = clean_doi(doi)
+    url = f'https://api.altmetric.com/v1/doi/{doi}'
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"Error fetching Altmetric data for DOI {doi}: {e}")
+        return {}
+
+
 def reconstruct_abstract(abstract_inverted_index):
     """
     Reconstructs the abstract from the abstract_inverted_index.
@@ -87,6 +146,7 @@ def reconstruct_abstract(abstract_inverted_index):
 
     return " ".join(abstract_words)
 
+    
 def rename_columns(df):
     """
     Renames the columns of the DataFrame to more descriptive names for clarity and user-friendliness.
@@ -232,57 +292,292 @@ def rename_columns(df):
     return df.rename(columns=column_mapping)
 
 
-@cache.memoize()
-def fetch_openalex_publications(search_query, max_results=100000):
-    works = []
-    per_page = 25
-    cursor = '*'
-    while True:
-        url = f"{search_query}&per-page={per_page}&cursor={cursor}"
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-            results = data.get('results', [])
-            if not results:
-                break
-            works.extend(results)
-            if len(works) >= max_results:
-                break
-            cursor = data.get('meta', {}).get('next_cursor')
-            if not cursor:
-                break
-        except requests.RequestException as e:
-            print(f"Error fetching OpenAlex publications: {e}")
-            break
-    return works
 
-@cache.memoize()
-def fetch_crossref_metadata(doi):
-    doi = clean_doi(doi)
-    url = f'https://api.crossref.org/works/{doi}'
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json().get('message', {})
-    except requests.RequestException as e:
-        print(f"Error fetching Crossref metadata for DOI {doi}: {e}")
-        return {}
+################################ Collect Publication Info  ################################
 
-@cache.memoize()
-def fetch_altmetric_data(doi):
-    doi = clean_doi(doi)
-    altmetric_url = f'https://api.altmetric.com/v1/doi/{doi}'
-    try:
-        response = requests.get(altmetric_url)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        print(f"Error fetching Altmetric data for DOI {doi}: {e}")
-        return {'error_doi': altmetric_url}  # Return the DOI causing the error
+def collect_publication_info(work, include_crossref, include_altmetric):
+    doi = work.get('doi', np.nan)
+    #print(f"Fetching metadata for DOI: {doi}")
+    crossref_metadata = fetch_crossref_metadata(doi) if include_crossref and pd.notna(doi) else {}
+    altmetric_data = fetch_altmetric_data(doi) if include_altmetric and pd.notna(doi) else {}
 
-def build_publications_dataframe(search_query, include_crossref, include_altmetric):
-    works = fetch_openalex_publications(search_query)
+    #-----------------------------------
+
+    # Extract Altmetric details
+    altmetric_id = altmetric_data.get('altmetric_id')
+    title = altmetric_data.get('title')
+    issns = altmetric_data.get('issns', [])
+    journal = altmetric_data.get('journal')
+
+    # Safely handle the cohorts field
+    cohorts = altmetric_data.get('cohorts', {})
+    if not isinstance(cohorts, dict):  # If cohorts is not a dictionary
+        # print(f"DOI causing cohorts issue: {doi}")
+        # print(f"Cohorts data type: {type(cohorts)}")
+        # print(f"Cohorts content: {cohorts}")
+        # Set cohorts values to 0 when the structure is unexpected
+        public_cohort = scientific_cohort = community_cohort = doctor_cohort = 0
+    else:
+        # Extract cohorts data if it is a dictionary
+        public_cohort = cohorts.get('pub', 0)
+        scientific_cohort = cohorts.get('sci', 0)
+        community_cohort = cohorts.get('com', 0)
+        doctor_cohort = cohorts.get('doc', 0)
+
+
+    # Extract context details
+    context = altmetric_data.get('context', {})
+    all_context = context.get('all', {})
+    journal_context = context.get('journal', {})
+    similar_age_3m_context = context.get('similar_age_3m', {})
+    similar_age_journal_3m_context = context.get('similar_age_journal_3m', {})
+
+    authors = altmetric_data.get('authors', [])
+    type_of_publication = altmetric_data.get('type')
+    pubdate = altmetric_data.get('pubdate')
+    epubdate = altmetric_data.get('epubdate')
+    publisher_subjects = altmetric_data.get('publisher_subjects', [])
+    scopus_subjects = altmetric_data.get('scopus_subjects', [])
+    cited_by_posts_count = altmetric_data.get('cited_by_posts_count', 0)
+
+    # Extract detailed cited-by categories
+    cited_by_categories = {
+        'Cited By Tweeters Count': altmetric_data.get('cited_by_tweeters_count', 0),
+        'Cited By MSM Count': altmetric_data.get('cited_by_msm_count', 0),
+        'Cited By Feeds Count': altmetric_data.get('cited_by_feeds_count', 0),
+        'Cited By FB Walls Count': altmetric_data.get('cited_by_fbwalls_count', 0),
+        'Cited By RDTs Count': altmetric_data.get('cited_by_rdts_count', 0),
+        'Cited By Wikipedia Count': altmetric_data.get('cited_by_wikipedia_count', 0),
+        'Cited By RH Count': altmetric_data.get('cited_by_rh_count', 0),
+        'Cited By Videos Count': altmetric_data.get('cited_by_videos_count', 0),
+        'Cited By QnA Count': altmetric_data.get('cited_by_qna_count', 0),
+        'Cited By Policies Count': altmetric_data.get('cited_by_policies_count', 0),
+        'Cited By Book Reviews Count': altmetric_data.get('cited_by_book_reviews_count', 0),
+        'Cited By Patents Count': altmetric_data.get('cited_by_patents_count', 0),
+        'Cited By Guidelines Count': altmetric_data.get('cited_by_guidelines_count', 0),
+        'Cited By Bluesky Count': altmetric_data.get('cited_by_bluesky_count', 0),
+        'Cited By Accounts Count': altmetric_data.get('cited_by_accounts_count', 0)
+    }
+
+    # Extract Altmetric score history
+    history = altmetric_data.get('history', {})
+    history_1y = history.get('1y', 0)
+    history_6m = history.get('6m', 0)
+    history_3m = history.get('3m', 0)
+    history_1m = history.get('1m', 0)
+    history_1w = history.get('1w', 0)
+    history_6d = history.get('6d', 0)
+    history_5d = history.get('5d', 0)
+    history_4d = history.get('4d', 0)
+    history_3d = history.get('3d', 0)
+    history_2d = history.get('2d', 0)
+    history_1d = history.get('1d', 0)
+    history_at = history.get('at', 0)    
+    
+    
+    readers = altmetric_data.get('readers', {})
+    readers_count = altmetric_data.get('readers_count', 0)
+    images = altmetric_data.get('images', {})
+    details_url = altmetric_data.get('details_url')
+    score = altmetric_data.get('score')
+    history = altmetric_data.get('history', {})
+
+    #-----------------------------------
+    
+    # Reconstruct the abstract if available
+    abstract_inverted_index = work.get('abstract_inverted_index')
+    abstract = reconstruct_abstract(abstract_inverted_index) if abstract_inverted_index else np.nan
+
+    #-----------------------------------
+    institutions_country = []
+    institution_type = []
+    first_authors_institutions_countries = []
+    last_authors_institutions_countries = []
+    corresponding_authors_institutions_countries = []
+
+    for authorship in work.get('authorships', []):
+        for institution in authorship.get('institutions', []):
+            institution_name = institution.get('display_name')
+            country_code = institution.get('country_code')
+            type_of_institution = institution.get('type')
+            institutions_country.append(f"{institution_name} ({country_code})")
+            institution_type.append(f"{institution_name} ({type_of_institution})")
+            if authorship.get('author_position') == 'first':
+                first_authors_institutions_countries.append(f"{institution_name} ({country_code})")
+            elif authorship.get('author_position') == 'last':
+                last_authors_institutions_countries.append(f"{institution_name} ({country_code})")
+            elif authorship.get('is_corresponding') == 'True':
+                corresponding_authors_institutions_countries.append(f"{institution_name} ({country_code})")
+
+    institutions_country = list(set(institutions_country))
+    institution_type = list(set(institution_type))
+    first_authors_institutions_countries = list(set(first_authors_institutions_countries))
+    last_authors_institutions_countries = list(set(last_authors_institutions_countries))
+    corresponding_authors_institutions_countries = list(set(corresponding_authors_institutions_countries))
+
+    author_countries = set()
+    for authorship in work.get('authorships', []):
+        for country in authorship.get('countries', []):
+            author_countries.add(country)
+    author_countries = list(author_countries)
+
+    first_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'first']
+    last_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'last']
+    corresponding_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('is_corresponding')]
+
+    first_authors = [authorship.get('author', {}) for authorship in first_authorships]
+    last_authors = [authorship.get('author', {}) for authorship in last_authorships]
+    corresponding_authors = [authorship.get('author', {}) for authorship in corresponding_authorships]
+
+    first_author_names = [author.get('display_name', '') for author in first_authors]
+    last_author_names = [author.get('display_name', '') for author in last_authors]
+    corresponding_author_names = [author.get('display_name', '') for author in corresponding_authors]
+
+    first_authors_countries = [authorship.get('countries', [np.nan])[0] if authorship.get('countries') else np.nan for authorship in first_authorships]
+    last_authors_countries = [authorship.get('countries', [np.nan])[0] if authorship.get('countries') else np.nan for authorship in last_authorships]
+    corresponding_authors_countries = [authorship.get('countries', [np.nan])[0] if authorship.get('countries') else np.nan for authorship in corresponding_authorships]
+
+    journal = np.nan
+    primary_location = work.get('primary_location', {})
+    #source = primary_location.get('source', {}) if isinstance(primary_location, dict) and 'source' in primary_location else {}
+    source = primary_location.get('source', {}) if isinstance(primary_location, dict) and primary_location and 'source' in primary_location else {}  
+
+
+    apc_list = work.get('apc_list', {}) or {}
+    apc_paid = work.get('apc_paid', {}) or {}
+
+    # Initialize the citation counts dictionary
+    citation_counts = {}
+    for count_data in work.get('counts_by_year', []):
+        year = count_data.get('year')
+        if year:
+            citation_counts[f'Citations {year}'] = count_data.get('cited_by_count', 0)
+
+    publication_info = {
+        'OpenAlex DOI': work.get('doi'),
+        'OpenAlex ID': work.get('id'),
+        'OpenAlex Title': work.get('display_name'),
+        'OpenAlex Abstract': abstract,
+        'OpenAlex Publication Year': work.get('publication_year'),
+        'OpenAlex Publication Date': work.get('publication_date'),
+        'OpenAlex Authors': ', '.join([authorship['author'].get('display_name', '') for authorship in work.get('authorships', [])]),
+        'OpenAlex First Authors': ', '.join(first_author_names),
+        'OpenAlex Last Authors': ', '.join(last_author_names),
+        'OpenAlex Corresponding Authors': ', '.join(corresponding_author_names),
+        'OpenAlex Institutions': ', '.join(institutions_country),
+        'OpenAlex Institutions Type': ', '.join(institution_type),
+        'OpenAlex First Authors Institutions Countries': ', '.join(first_authors_institutions_countries),
+        'OpenAlex Last Authors Institutions Countries': ', '.join(last_authors_institutions_countries),
+        'OpenAlex Institutions Distinct Count': work.get('institutions_distinct_count'),
+        'OpenAlex Countries': ', '.join(map(str, author_countries)),
+        'OpenAlex First Authors Countries': ', '.join(map(str, first_authors_countries)),
+        'OpenAlex Last Authors Countries': ', '.join(map(str, last_authors_countries)),
+        'OpenAlex Corresponding Authors Countries': ', '.join(map(str, corresponding_authors_countries)),
+        'OpenAlex Countries Distinct Count': work.get('countries_distinct_count'),
+        'OpenAlex Journal': source['display_name'] if source else np.nan,
+        'is_in_doaj': source['is_in_doaj'] if source else np.nan,
+        'OpenAlex Crossref Publisher': crossref_metadata.get('publisher', ''),
+        'OpenAlex Crossref Subject': ', '.join(crossref_metadata.get('subject', [])),
+        'OpenAlex topics': ', '.join([topic.get('display_name') for topic in work.get('topics', [])]),
+        'OpenAlex Keywords': ', '.join([keyword.get('display_name') for keyword in work.get('keywords', [])]),
+        'OpenAlex Mesh': ', '.join([mesh.get('descriptor_name') for mesh in work.get('mesh', [])]),
+        'OpenAlex Concepts': ', '.join([concept.get('display_name') for concept in work.get('concepts', [])]),
+        'OpenAlex Sustainable Development Goals': ', '.join([sdg.get('display_name') for sdg in work.get('sustainable_development_goals', [])]),
+        'Crossref Citation count': crossref_metadata.get('is-referenced-by-count', 0),
+        'OpenAlex Cited by Count': work.get('cited_by_count'),
+        'OpenAlex Counts by Year': str(work.get('counts_by_year')),
+        'OpenAlex Publication Type': work.get('type'),
+        'OpenAlex Indexed In': str(work.get('indexed_in')),
+        'OpenAlex Language': work.get('language'),
+        'OpenAlex Open Access': work.get('open_access', {}).get('is_oa', None),
+        'OpenAlex Open Access status': work.get('open_access', {}).get('oa_status', None),
+        'OpenAlex grants': ', '.join([grant.get('funder_display_name') for grant in work.get('grants', [])]),
+        'Crossref Funders': ', '.join(funder.get('name', '') for funder in crossref_metadata.get('funder', [])),
+        
+        'apc_list_value': apc_list.get('value', None),
+        'apc_list_currency': apc_list.get('currency', None),
+        'apc_list_value_usd': apc_list.get('value_usd', None),
+        'apc_list_provenance': apc_list.get('provenance', None),
+        # 'apc_paid_value': apc_paid.get('value', None),
+        # 'apc_paid_currency': apc_paid.get('currency', None),
+        # 'apc_paid_value_usd': apc_paid.get('value_usd', None),
+        # 'apc_paid_provenance': apc_paid.get('provenance', None),
+
+        'Altmetric ID': altmetric_id,
+        # 'Title': title,
+        # 'DOI': doi,
+        # 'ISSNs': ', '.join(issns),
+        # 'Journal': journal,
+        # 'Type': type_of_publication,
+        # 'Authors': ', '.join(authors),
+        # 'Publication Date': pubdate,
+        # 'ePublication Date': epubdate,
+        'Publisher Subjects': ', '.join([subject['name'] for subject in publisher_subjects]),
+        'Scopus Subjects': ', '.join(scopus_subjects),
+
+        'Cohort - Public': public_cohort,
+        'Cohort - Scientific': scientific_cohort,
+        'Cohort - Community': community_cohort,
+        'Cohort - Doctor': doctor_cohort,
+
+        'Cited By Posts Count': cited_by_posts_count,
+        
+        **cited_by_categories,  # Include all cited-by categories
+        'Readers CiteULike': readers.get('citeulike', 0),
+        'Readers Mendeley': readers.get('mendeley', 0),
+        'Readers Connotea': readers.get('connotea', 0),
+        'Readers Count': readers_count,
+        'Altmetric Score': score,
+
+        'Altmetric Score History': str(altmetric_data.get('history')),
+        'History (1 Year)': history_1y,
+        'History (6 Months)': history_6m,
+        'History (3 Months)': history_3m,
+        'History (1 Month)': history_1m,
+        'History (1 Week)': history_1w,
+        'History (6 Days)': history_6d,
+        'History (5 Days)': history_5d,
+        'History (4 Days)': history_4d,
+        'History (3 Days)': history_3d,
+        'History (2 Days)': history_2d,
+        'History (1 Day)': history_1d,
+        'History (At)': history_at,
+
+        'All Context Count': all_context.get('count', 0),
+        'All Context Mean': all_context.get('mean', 0),
+        'All Context Rank': all_context.get('rank', 0),
+        'All Context Pct': all_context.get('pct', 0),
+        'Journal Context Count': journal_context.get('count', 0),
+        'Journal Context Mean': journal_context.get('mean', 0),
+        'Journal Context Rank': journal_context.get('rank', 0),
+        'Journal Context Pct': journal_context.get('pct', 0),
+        'Similar Age 3m Context Count': similar_age_3m_context.get('count', 0),
+        'Similar Age 3m Context Mean': similar_age_3m_context.get('mean', 0),
+        'Similar Age 3m Context Rank': similar_age_3m_context.get('rank', 0),
+        'Similar Age 3m Context Pct': similar_age_3m_context.get('pct', 0),
+        'Similar Age Journal 3m Context Count': similar_age_journal_3m_context.get('count', 0),
+        'Similar Age Journal 3m Context Mean': similar_age_journal_3m_context.get('mean', 0),
+        'Similar Age Journal 3m Context Rank': similar_age_journal_3m_context.get('rank', 0),
+        'Similar Age Journal 3m Context Pct': similar_age_journal_3m_context.get('pct', 0),
+        'Altmetric Badge Small': images.get('small'),
+        # 'Altmetric Badge Medium': images.get('medium'),
+        # 'Altmetric Badge Large': images.get('large'),
+        'Details URL': details_url,
+
+        'number_of_authors': len(work.get('authorships', [])),
+        'OpenAlex Countries Distinct Count': work.get('countries_distinct_count'),
+    }
+
+    # Add citation counts to publication_info
+    publication_info.update(citation_counts)
+
+    return publication_info
+
+
+
+############# Functions to process data and build publications dataframe ############################
+
+def build_publications_dataframe(works, include_crossref, include_altmetric):
     publications_data = [collect_publication_info(work, include_crossref, include_altmetric) for work in works]
     df = pd.DataFrame(publications_data)
 
@@ -507,7 +802,6 @@ def build_publications_dataframe(search_query, include_crossref, include_altmetr
     "TG": {"name": "Togo", "region": "Africa", "income": "Low income"}
     }
 
-
     # Replace country codes with full names, regions, and incomes for relevant columns
     country_columns = [
         'OpenAlex Countries',
@@ -521,343 +815,253 @@ def build_publications_dataframe(search_query, include_crossref, include_altmetr
         df[f'{column} Region'] = df[column].apply(lambda x: np.nan if pd.isna(x) else ', '.join([str(country_mapping.get(str(code), {}).get("region", '')) for code in str(x).split(', ')]))
         df[f'{column} Income'] = df[column].apply(lambda x: np.nan if pd.isna(x) else ', '.join([str(country_mapping.get(str(code), {}).get("income", '')) for code in str(x).split(', ')]))
 
-    return df
+    return rename_columns(df)
+    # return rename_columns(pd.DataFrame(publications_data))
 
-def collect_publication_info(work, include_crossref, include_altmetric):
-    doi = work.get('doi', np.nan)
-    #print(f"Fetching metadata for DOI: {doi}")
-    crossref_metadata = fetch_crossref_metadata(doi) if include_crossref and pd.notna(doi) else {}
-    altmetric_data = fetch_altmetric_data(doi) if include_altmetric and pd.notna(doi) else {}
+# Layout
+
+def layout():
+    return dbc.Container([
+        Navbar(),
+        create_onboarding_modal(),
+
+        dbc.Row(dbc.Col(html.H1('Publication Metadata Collector'), className="d-flex justify-content-center")),
+        dbc.Row(dbc.Col(html.P("Select your input method to fetch and enrich publication data."), className="d-flex justify-content-center")),
+
+        dbc.Row([
+            dbc.Col(dcc.RadioItems(
+                id='input-type',
+                options=[
+                    {'label': 'OpenAlex API    .', 'value': 'api'},
+                    {'label': 'DOI Only    .', 'value': 'doi'},
+                    {'label': 'Both API and DOI', 'value': 'both'}
+                ],
+                value='api',
+                inline=True,
+                className="mb-4"
+            ), width=12, className="d-flex justify-content-center")
+        ]),
+
+        dbc.Row([
+            dbc.Col([
+                dcc.Input(
+                    id='api-input', 
+                    type='text', 
+                    placeholder='Enter OpenAlex API query', 
+                    debounce=True, 
+                    style={'display': 'block', 'width': '100%'},
+                    className="mb-3 mx-auto"
+                ),
+                html.Div([
+                    dcc.Upload(
+                        id='doi-upload',
+                        children=html.Div([
+                            'Drag and Drop or ',
+                            html.A('Select a File')
+                        ]),
+                        accept='.csv, .txt',
+                        style={'display': 'none'}
+                    )
+                ], style={'border': '1px dashed', 'padding': '10px', 'textAlign': 'center', 'margin-top': '10px'}),
+                # html.Div(id='file-upload-alert', style={'display': 'none'}, color="info"),
+
+                html.Div(
+                    "Or manually enter DOIs (comma-separated):", 
+                    style={'margin-top': '20px', 'display': 'none'}, 
+                    id='manual-doi-label'
+                ),
+                dcc.Textarea(
+                    id='manual-doi-input', 
+                    placeholder='e.g., 10.1001/jama.2018.12345', 
+                    style={'margin-top': '10px', 'display': 'none', 'height': '200px', 'width': '100%'},
+                    className="mb-3 mx-auto"
+                )
+            ], width=5, className="justify-content-center align-items-center flex-column")
+        ], justify="center"),
 
 
-    # Check for Altmetric error and log the DOI causing the issue
-    # if 'error_doi' in altmetric_data:
-    #     print(f"DOI causing Altmetric issue: {altmetric_data['error_doi']}")
-    #     return {'DOI': altmetric_data['error_doi'], 'Altmetric Error': True}
 
-    #-----------------------------------
+        dbc.Row([
+            dbc.Col(html.Button('Submit', id='submit-button', className="mt-3 btn-primary"), className="d-flex justify-content-center")
+        ]),
 
-    # Extract Altmetric details
-    altmetric_id = altmetric_data.get('altmetric_id')
-    title = altmetric_data.get('title')
-    issns = altmetric_data.get('issns', [])
-    journal = altmetric_data.get('journal')
+        dbc.Row(dbc.Col(dbc.Checklist(
+            options=[
+                {'label': 'Include Crossref Data', 'value': 'crossref'},
+                {'label': 'Include Altmetric Data', 'value': 'altmetric'}
+            ],
+            value=[],
+            id='data-options',
+            inline=True,
+            className="text-center"
+        ), className="d-flex justify-content-center")),
 
-    # Safely handle the cohorts field
-    cohorts = altmetric_data.get('cohorts', {})
-    if not isinstance(cohorts, dict):  # If cohorts is not a dictionary
-        print(f"DOI causing cohorts issue: {doi}")
-        print(f"Cohorts data type: {type(cohorts)}")
-        print(f"Cohorts content: {cohorts}")
-        # Set cohorts values to 0 when the structure is unexpected
-        public_cohort = scientific_cohort = community_cohort = doctor_cohort = 0
+        dbc.Row(dbc.Col(dbc.Alert(id='file-upload-alert', color="info", style={"display": "none"}), className="d-flex justify-content-center")),
+        dbc.Row(dbc.Col(dbc.Alert(id='status-alert', color="info", style={"display": "none"}), className="d-flex justify-content-center")),
+        dbc.Row(dbc.Col(html.Div(id='spinner-container', children=[
+            dbc.Spinner(size="lg", color="primary")
+        ], style={'display': 'none'}), className="d-flex justify-content-center")),
+
+        dbc.Row([
+            dbc.Col(dbc.Progress(id="progress-bar", value=0, striped=True, animated=True, style={"display": "none"}))
+        ]),
+
+
+        dbc.Row(dbc.Col(html.Button('Download Publications List', id='download-button', disabled=True, style={'display': 'none'}), className="d-flex justify-content-center")),
+        dcc.Download(id='download-link'),
+
+        dcc.Store(id='stored-data'),
+        html.Div(id='table-container', className="mt-3"),
+
+        Footer()
+    ], fluid=True)#, className="justify-content-center align-items-center flex-column")
+
+
+############################ Callbacks for the input fields ############################
+@app.callback(
+    Output("onboarding-modal", "is_open"),
+    [Input("close-onboarding", "n_clicks")],
+    [State("onboarding-modal", "is_open")],
+)
+def toggle_modal(n_clicks, is_open):
+    if n_clicks:
+        return not is_open
+    return is_open
+
+
+@app.callback(
+    [
+        Output('api-input', 'style'),
+        Output('doi-upload', 'style'),
+        Output('manual-doi-label', 'style'),
+        Output('manual-doi-input', 'style')
+    ],
+    [Input('input-type', 'value')]
+)
+def toggle_input_fields(input_type):
+    if input_type == 'api':
+        return (
+            {'display': 'block', 'width': '100%'},  # Show API input
+            {'display': 'none'},  # Hide file upload
+            {'display': 'none'},  # Hide manual DOI label
+            {'display': 'none'}   # Hide manual DOI input
+        )
+    elif input_type == 'doi':
+        return (
+            {'display': 'none'},  # Hide API input
+            {'display': 'block', 'width': '100%'},  # Show file upload
+            {'display': 'block'},  # Show manual DOI label
+            {'display': 'block', 'width': '100%'}   # Show manual DOI input
+        )
+    elif input_type == 'both':
+        return (
+            {'display': 'block', 'width': '100%'},  # Show API input
+            {'display': 'block', 'width': '100%'},  # Show file upload
+            {'display': 'block'},  # Show manual DOI label
+            {'display': 'block', 'width': '100%'}   # Show manual DOI input
+        )
     else:
-        # Extract cohorts data if it is a dictionary
-        public_cohort = cohorts.get('pub', 0)
-        scientific_cohort = cohorts.get('sci', 0)
-        community_cohort = cohorts.get('com', 0)
-        doctor_cohort = cohorts.get('doc', 0)
+        return (
+            {'display': 'none'},  # Hide all
+            {'display': 'none'},
+            {'display': 'none'},
+            {'display': 'none'}
+        )
 
-
-    # Extract context details
-    context = altmetric_data.get('context', {})
-    all_context = context.get('all', {})
-    journal_context = context.get('journal', {})
-    similar_age_3m_context = context.get('similar_age_3m', {})
-    similar_age_journal_3m_context = context.get('similar_age_journal_3m', {})
-
-    authors = altmetric_data.get('authors', [])
-    type_of_publication = altmetric_data.get('type')
-    pubdate = altmetric_data.get('pubdate')
-    epubdate = altmetric_data.get('epubdate')
-    publisher_subjects = altmetric_data.get('publisher_subjects', [])
-    scopus_subjects = altmetric_data.get('scopus_subjects', [])
-    cited_by_posts_count = altmetric_data.get('cited_by_posts_count', 0)
-
-    # Extract detailed cited-by categories
-    cited_by_categories = {
-        'Cited By Tweeters Count': altmetric_data.get('cited_by_tweeters_count', 0),
-        'Cited By MSM Count': altmetric_data.get('cited_by_msm_count', 0),
-        'Cited By Feeds Count': altmetric_data.get('cited_by_feeds_count', 0),
-        'Cited By FB Walls Count': altmetric_data.get('cited_by_fbwalls_count', 0),
-        'Cited By RDTs Count': altmetric_data.get('cited_by_rdts_count', 0),
-        'Cited By Wikipedia Count': altmetric_data.get('cited_by_wikipedia_count', 0),
-        'Cited By RH Count': altmetric_data.get('cited_by_rh_count', 0),
-        'Cited By Videos Count': altmetric_data.get('cited_by_videos_count', 0),
-        'Cited By QnA Count': altmetric_data.get('cited_by_qna_count', 0),
-        'Cited By Policies Count': altmetric_data.get('cited_by_policies_count', 0),
-        'Cited By Book Reviews Count': altmetric_data.get('cited_by_book_reviews_count', 0),
-        'Cited By Patents Count': altmetric_data.get('cited_by_patents_count', 0),
-        'Cited By Guidelines Count': altmetric_data.get('cited_by_guidelines_count', 0),
-        'Cited By Bluesky Count': altmetric_data.get('cited_by_bluesky_count', 0),
-        'Cited By Accounts Count': altmetric_data.get('cited_by_accounts_count', 0)
-    }
-
-    # Extract Altmetric score history
-    history = altmetric_data.get('history', {})
-    history_1y = history.get('1y', 0)
-    history_6m = history.get('6m', 0)
-    history_3m = history.get('3m', 0)
-    history_1m = history.get('1m', 0)
-    history_1w = history.get('1w', 0)
-    history_6d = history.get('6d', 0)
-    history_5d = history.get('5d', 0)
-    history_4d = history.get('4d', 0)
-    history_3d = history.get('3d', 0)
-    history_2d = history.get('2d', 0)
-    history_1d = history.get('1d', 0)
-    history_at = history.get('at', 0)    
-    
-    
-    readers = altmetric_data.get('readers', {})
-    readers_count = altmetric_data.get('readers_count', 0)
-    images = altmetric_data.get('images', {})
-    details_url = altmetric_data.get('details_url')
-    score = altmetric_data.get('score')
-    history = altmetric_data.get('history', {})
-
-    #-----------------------------------
-    
-    # Reconstruct the abstract if available
-    abstract_inverted_index = work.get('abstract_inverted_index')
-    abstract = reconstruct_abstract(abstract_inverted_index) if abstract_inverted_index else np.nan
-
-    #-----------------------------------
-    institutions_country = []
-    institution_type = []
-    first_authors_institutions_countries = []
-    last_authors_institutions_countries = []
-    corresponding_authors_institutions_countries = []
-
-    for authorship in work.get('authorships', []):
-        for institution in authorship.get('institutions', []):
-            institution_name = institution.get('display_name')
-            country_code = institution.get('country_code')
-            type_of_institution = institution.get('type')
-            institutions_country.append(f"{institution_name} ({country_code})")
-            institution_type.append(f"{institution_name} ({type_of_institution})")
-            if authorship.get('author_position') == 'first':
-                first_authors_institutions_countries.append(f"{institution_name} ({country_code})")
-            elif authorship.get('author_position') == 'last':
-                last_authors_institutions_countries.append(f"{institution_name} ({country_code})")
-            elif authorship.get('is_corresponding') == 'True':
-                corresponding_authors_institutions_countries.append(f"{institution_name} ({country_code})")
-
-    institutions_country = list(set(institutions_country))
-    institution_type = list(set(institution_type))
-    first_authors_institutions_countries = list(set(first_authors_institutions_countries))
-    last_authors_institutions_countries = list(set(last_authors_institutions_countries))
-    corresponding_authors_institutions_countries = list(set(corresponding_authors_institutions_countries))
-
-    author_countries = set()
-    for authorship in work.get('authorships', []):
-        for country in authorship.get('countries', []):
-            author_countries.add(country)
-    author_countries = list(author_countries)
-
-    first_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'first']
-    last_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('author_position') == 'last']
-    corresponding_authorships = [authorship for authorship in work.get('authorships', []) if authorship.get('is_corresponding')]
-
-    first_authors = [authorship.get('author', {}) for authorship in first_authorships]
-    last_authors = [authorship.get('author', {}) for authorship in last_authorships]
-    corresponding_authors = [authorship.get('author', {}) for authorship in corresponding_authorships]
-
-    first_author_names = [author.get('display_name', '') for author in first_authors]
-    last_author_names = [author.get('display_name', '') for author in last_authors]
-    corresponding_author_names = [author.get('display_name', '') for author in corresponding_authors]
-
-    first_authors_countries = [authorship.get('countries', [np.nan])[0] if authorship.get('countries') else np.nan for authorship in first_authorships]
-    last_authors_countries = [authorship.get('countries', [np.nan])[0] if authorship.get('countries') else np.nan for authorship in last_authorships]
-    corresponding_authors_countries = [authorship.get('countries', [np.nan])[0] if authorship.get('countries') else np.nan for authorship in corresponding_authorships]
-
-    journal = np.nan
-    primary_location = work.get('primary_location', {})
-    #source = primary_location.get('source', {}) if isinstance(primary_location, dict) and 'source' in primary_location else {}
-    source = primary_location.get('source', {}) if isinstance(primary_location, dict) and primary_location and 'source' in primary_location else {}  
-
-
-    apc_list = work.get('apc_list', {}) or {}
-    apc_paid = work.get('apc_paid', {}) or {}
-
-    # Initialize the citation counts dictionary
-    citation_counts = {}
-    for count_data in work.get('counts_by_year', []):
-        year = count_data.get('year')
-        if year:
-            citation_counts[f'Citations {year}'] = count_data.get('cited_by_count', 0)
-
-    publication_info = {
-        'OpenAlex DOI': work.get('doi'),
-        'OpenAlex ID': work.get('id'),
-        'OpenAlex Title': work.get('display_name'),
-        'OpenAlex Abstract': abstract,
-        'OpenAlex Publication Year': work.get('publication_year'),
-        'OpenAlex Publication Date': work.get('publication_date'),
-        'OpenAlex Authors': ', '.join([authorship['author'].get('display_name', '') for authorship in work.get('authorships', [])]),
-        'OpenAlex First Authors': ', '.join(first_author_names),
-        'OpenAlex Last Authors': ', '.join(last_author_names),
-        'OpenAlex Corresponding Authors': ', '.join(corresponding_author_names),
-        'OpenAlex Institutions': ', '.join(institutions_country),
-        'OpenAlex Institutions Type': ', '.join(institution_type),
-        'OpenAlex First Authors Institutions Countries': ', '.join(first_authors_institutions_countries),
-        'OpenAlex Last Authors Institutions Countries': ', '.join(last_authors_institutions_countries),
-        'OpenAlex Institutions Distinct Count': work.get('institutions_distinct_count'),
-        'OpenAlex Countries': ', '.join(map(str, author_countries)),
-        'OpenAlex First Authors Countries': ', '.join(map(str, first_authors_countries)),
-        'OpenAlex Last Authors Countries': ', '.join(map(str, last_authors_countries)),
-        'OpenAlex Corresponding Authors Countries': ', '.join(map(str, corresponding_authors_countries)),
-        'OpenAlex Countries Distinct Count': work.get('countries_distinct_count'),
-        'OpenAlex Journal': source['display_name'] if source else np.nan,
-        'is_in_doaj': source['is_in_doaj'] if source else np.nan,
-        'OpenAlex Crossref Publisher': crossref_metadata.get('publisher', ''),
-        'OpenAlex Crossref Subject': ', '.join(crossref_metadata.get('subject', [])),
-        'OpenAlex topics': ', '.join([topic.get('display_name') for topic in work.get('topics', [])]),
-        'OpenAlex Keywords': ', '.join([keyword.get('display_name') for keyword in work.get('keywords', [])]),
-        'OpenAlex Mesh': ', '.join([mesh.get('descriptor_name') for mesh in work.get('mesh', [])]),
-        'OpenAlex Concepts': ', '.join([concept.get('display_name') for concept in work.get('concepts', [])]),
-        'OpenAlex Sustainable Development Goals': ', '.join([sdg.get('display_name') for sdg in work.get('sustainable_development_goals', [])]),
-        'Crossref Citation count': crossref_metadata.get('is-referenced-by-count', 0),
-        'OpenAlex Cited by Count': work.get('cited_by_count'),
-        'OpenAlex Counts by Year': str(work.get('counts_by_year')),
-        'OpenAlex Publication Type': work.get('type'),
-        'OpenAlex Indexed In': str(work.get('indexed_in')),
-        'OpenAlex Language': work.get('language'),
-        'OpenAlex Open Access': work.get('open_access', {}).get('is_oa', None),
-        'OpenAlex Open Access status': work.get('open_access', {}).get('oa_status', None),
-        'OpenAlex grants': ', '.join([grant.get('funder_display_name') for grant in work.get('grants', [])]),
-        'Crossref Funders': ', '.join(funder.get('name', '') for funder in crossref_metadata.get('funder', [])),
-        
-        'apc_list_value': apc_list.get('value', None),
-        'apc_list_currency': apc_list.get('currency', None),
-        'apc_list_value_usd': apc_list.get('value_usd', None),
-        'apc_list_provenance': apc_list.get('provenance', None),
-        'apc_paid_value': apc_paid.get('value', None),
-        'apc_paid_currency': apc_paid.get('currency', None),
-        'apc_paid_value_usd': apc_paid.get('value_usd', None),
-        'apc_paid_provenance': apc_paid.get('provenance', None),
-
-        'Altmetric ID': altmetric_id,
-        # 'Title': title,
-        # 'DOI': doi,
-        # 'ISSNs': ', '.join(issns),
-        # 'Journal': journal,
-        # 'Type': type_of_publication,
-        # 'Authors': ', '.join(authors),
-        # 'Publication Date': pubdate,
-        # 'ePublication Date': epubdate,
-        'Publisher Subjects': ', '.join([subject['name'] for subject in publisher_subjects]),
-        'Scopus Subjects': ', '.join(scopus_subjects),
-
-        'Cohort - Public': public_cohort,
-        'Cohort - Scientific': scientific_cohort,
-        'Cohort - Community': community_cohort,
-        'Cohort - Doctor': doctor_cohort,
-
-        'Cited By Posts Count': cited_by_posts_count,
-        
-        **cited_by_categories,  # Include all cited-by categories
-        'Readers CiteULike': readers.get('citeulike', 0),
-        'Readers Mendeley': readers.get('mendeley', 0),
-        'Readers Connotea': readers.get('connotea', 0),
-        'Readers Count': readers_count,
-        'Altmetric Score': score,
-
-        'Altmetric Score History': str(altmetric_data.get('history')),
-        'History (1 Year)': history_1y,
-        'History (6 Months)': history_6m,
-        'History (3 Months)': history_3m,
-        'History (1 Month)': history_1m,
-        'History (1 Week)': history_1w,
-        'History (6 Days)': history_6d,
-        'History (5 Days)': history_5d,
-        'History (4 Days)': history_4d,
-        'History (3 Days)': history_3d,
-        'History (2 Days)': history_2d,
-        'History (1 Day)': history_1d,
-        'History (At)': history_at,
-
-        'All Context Count': all_context.get('count', 0),
-        'All Context Mean': all_context.get('mean', 0),
-        'All Context Rank': all_context.get('rank', 0),
-        'All Context Pct': all_context.get('pct', 0),
-        'Journal Context Count': journal_context.get('count', 0),
-        'Journal Context Mean': journal_context.get('mean', 0),
-        'Journal Context Rank': journal_context.get('rank', 0),
-        'Journal Context Pct': journal_context.get('pct', 0),
-        'Similar Age 3m Context Count': similar_age_3m_context.get('count', 0),
-        'Similar Age 3m Context Mean': similar_age_3m_context.get('mean', 0),
-        'Similar Age 3m Context Rank': similar_age_3m_context.get('rank', 0),
-        'Similar Age 3m Context Pct': similar_age_3m_context.get('pct', 0),
-        'Similar Age Journal 3m Context Count': similar_age_journal_3m_context.get('count', 0),
-        'Similar Age Journal 3m Context Mean': similar_age_journal_3m_context.get('mean', 0),
-        'Similar Age Journal 3m Context Rank': similar_age_journal_3m_context.get('rank', 0),
-        'Similar Age Journal 3m Context Pct': similar_age_journal_3m_context.get('pct', 0),
-        'Altmetric Badge Small': images.get('small'),
-        'Altmetric Badge Medium': images.get('medium'),
-        'Altmetric Badge Large': images.get('large'),
-        'Details URL': details_url,
-
-        'number_of_authors': len(work.get('authorships', [])),
-        'OpenAlex Countries Distinct Count': work.get('countries_distinct_count'),
-    }
-
-    # Add citation counts to publication_info
-    publication_info.update(citation_counts)
-
-    return publication_info
-
-
-
-
+########################### Callbacks for the main layout ###########################
 @app.callback(
     [
         Output('status-alert', 'children'),
         Output('status-alert', 'style'),
         Output('spinner-container', 'style'),
-        Output('stored-search-query', 'data'),
+        Output('stored-data', 'data'),
         Output('table-container', 'children'),
         Output('download-button', 'disabled'),
         Output('download-button', 'style'),
-        Output('stored-data', 'data'),
+        Output('file-upload-alert', 'children'),
+        Output('file-upload-alert', 'style'),
+        Output('progress-bar', 'style'),
+        Output('progress-bar', 'value'),
+        Output('progress-bar', 'label')
     ],
-    [Input('submit-button', 'n_clicks')],
-    [State('search-input', 'value'), State('data-options', 'value')],
+    [Input('input-type', 'value'), Input('submit-button', 'n_clicks'), Input('doi-upload', 'contents')],
+    [State('api-input', 'value'), State('manual-doi-input', 'value'), State('data-options', 'value'), State('doi-upload', 'filename')],
     prevent_initial_call=True
 )
-def validate_fetch_and_update_ui(n_clicks, search_query, data_options):
-    if not search_query:
-        return (
-            "Missing search query. Please enter a search term and try again.",
-            {'display': 'block', 'color': 'warning'},
-            {'display': 'none'},
-            no_update,
-            no_update,
-            True,
-            {'display': 'none'},
-            no_update,
-        )
-
-    spinner_style = {'display': 'block'}
-    message = "Valid search. Fetching publications, please wait..."
-    alert_style = {'display': 'block', 'color': 'primary'}
+def process_inputs(input_type, n_clicks, file_contents, api_input, manual_doi_input, data_options, filename):
+    if n_clicks is None:
+        raise PreventUpdate
 
     include_crossref = 'crossref' in data_options
     include_altmetric = 'altmetric' in data_options
 
     try:
-        df = rename_columns(build_publications_dataframe(search_query, include_crossref, include_altmetric))
-        if df.empty:
+        dois = []
+        file_upload_alert = ""
+        file_upload_alert_style = {'display': 'none'}
+
+        if file_contents:
+            dois = parse_uploaded_file(file_contents, filename)
+            file_upload_alert = f"File '{filename}' uploaded successfully."
+            file_upload_alert_style = {'display': 'block', 'color': 'success'}
+
+        if manual_doi_input:
+            manual_dois = [clean_doi(doi.strip()) for doi in manual_doi_input.split(',') if doi.strip()]
+            dois.extend(manual_dois)
+
+        if input_type in ['doi', 'both'] and not dois:
             return (
-                "No publications found for the provided search query.",
-                {'display': 'block', 'color': 'secondary'},
+                "No DOIs provided.",
+                {'display': 'block', 'color': 'warning'},
                 {'display': 'none'},
-                search_query,
-                no_update,
+                None,
+                None,
                 True,
                 {'display': 'none'},
-                no_update,
+                file_upload_alert,
+                file_upload_alert_style,
+                {'display': 'none'},
+                0,
+                ""
             )
+
+
+        if input_type == 'api':
+            works = fetch_openalex_publications(api_input)
+        elif input_type == 'doi':
+            works = fetch_works_by_doi(dois)
+        elif input_type == 'both':
+            api_works = fetch_openalex_publications(api_input)
+            doi_works = fetch_works_by_doi(dois)
+            works = api_works + doi_works
+            # Remove duplicate works based on DOI
+            unique_works = {work['doi']: work for work in works if 'doi' in work}
+            works = list(unique_works.values())
+
+        if not works:
+            return (
+            "No publications found.",
+            {'display': 'block', 'color': 'warning'},
+            {'display': 'none'},
+            None,
+            None,
+            True,
+            {'display': 'none'},
+            file_upload_alert,
+            file_upload_alert_style,
+            {'display': 'none'},
+            0,
+            ""
+            )
+        # else:
+        #     print (
+        #     "Processing publications, please wait......",
+        #     {'display': 'block', 'color': 'info'},
+        #     {'display': 'none'},
+        #     )
+            
+
+        df = build_publications_dataframe(works, include_crossref, include_altmetric)
 
         tooltip_data = [
             {column: {'value': str(value), 'type': 'markdown'} for column, value in row.items()}
@@ -878,39 +1082,50 @@ def validate_fetch_and_update_ui(n_clicks, search_query, data_options):
         ), size="lg", color="primary", type="border", fullscreen=True)
 
         return (
-            "Publications ready. You can now view or download the list.",
+            f"{len(df)} publications fetched successfully.",
             {'display': 'block', 'color': 'success'},
             {'display': 'none'},
-            search_query,
+            df.to_dict('records'),
             table,
             False,
             {'display': 'block'},
-            df.to_dict('records'),
-        )
-    except Exception as e:
-        return (
-            f"An error occurred: {str(e)}",
-            {'display': 'block', 'color': 'danger'},
-            {'display': 'none'},
-            no_update,
-            no_update,
-            True,
-            {'display': 'none'},
-            no_update,
+            file_upload_alert,
+            file_upload_alert_style,
+            {'display': 'block'},
+            100,
+            "Completed"
         )
 
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return (
+            f"An error occurred: {e}",
+            {'display': 'block', 'color': 'danger'},
+            {'display': 'none'},
+            None,
+            None,
+            True,
+            {'display': 'none'},
+            f"An error occurred while uploading the file: {e}",
+            {'display': 'block', 'color': 'danger'},
+            {'display': 'none'},
+            0,
+            ""
+        )
+########################### Callbacks for the download button ###########################
 @app.callback(
     Output('download-link', 'data'),
     [Input('download-button', 'n_clicks')],
-    [State('stored-data', 'data'), State('search-input', 'value')],
+    [State('stored-data', 'data')],
     prevent_initial_call=True
 )
-def download_publications_list(n_clicks, stored_data, search_query):
-    if n_clicks is None or stored_data is None:
+def download_publications_list(n_clicks, stored_data):
+    if not stored_data:
         raise PreventUpdate
-    safe_search_query = re.sub(r'[^\w\-_]', '_', search_query)
-    filename = f"{safe_search_query}_publications_list.csv"
+
     df = pd.DataFrame(stored_data)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"publications_list_{timestamp}.csv"
     return dcc.send_data_frame(df.to_csv, filename, index=False)
 
 @app.callback(
@@ -922,6 +1137,7 @@ def toggle_navbar_collapse(n, is_open):
     if n:
         return not is_open
     return is_open
-
+    
 if __name__ == '__main__':
+    app.layout = layout()
     app.run_server(debug=True)
